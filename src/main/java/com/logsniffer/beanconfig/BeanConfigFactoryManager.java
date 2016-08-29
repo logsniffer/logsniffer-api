@@ -1,0 +1,186 @@
+package com.logsniffer.beanconfig;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import javax.annotation.PostConstruct;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
+import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.core.type.filter.AssignableTypeFilter;
+
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.DeserializationConfig;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.deser.BeanDeserializerModifier;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.logsniffer.app.configvalue.ConfigInjector;
+import com.logsniffer.beanconfig.ConfiguredBean.ConfiguredBeanDeserializer;
+
+/**
+ * Manages creating, serialization and deserialization of bean configs.
+ * 
+ * @author mbok
+ * 
+ */
+public class BeanConfigFactoryManager implements ConfigBeanTypeResolver {
+	private final Logger logger = LoggerFactory.getLogger(getClass());
+
+	@Autowired(required = false)
+	private BeanPostConstructor<?>[] postConstructors;
+
+	private final HashMap<Class<?>, BeanPostConstructor<?>> mappedPostConstrucors = new HashMap<Class<?>, BeanPostConstructor<?>>();
+
+	@Autowired
+	private ObjectMapper jsonMapper;
+
+	@Autowired
+	private ConfigInjector configInjector;
+
+	private final Map<Class<? extends ConfiguredBean>, List<String>> configBeanNames = new HashMap<>();;
+
+	@SuppressWarnings("unchecked")
+	@PostConstruct
+	private void initJsonMapper() {
+		final SimpleModule module = new SimpleModule();
+		module.setDeserializerModifier(new BeanDeserializerModifier() {
+			@Override
+			public JsonDeserializer<?> modifyDeserializer(final DeserializationConfig config,
+					final BeanDescription beanDesc, final JsonDeserializer<?> deserializer) {
+				if (ConfiguredBean.class.isAssignableFrom(beanDesc.getBeanClass())) {
+					return new ConfiguredBeanDeserializer(deserializer);
+				}
+				return deserializer;
+			}
+		});
+		jsonMapper.registerModule(module);
+		if (postConstructors != null) {
+			for (final BeanPostConstructor<?> bpc : postConstructors) {
+				mappedPostConstrucors.put(bpc.getClass(), bpc);
+			}
+		}
+
+		// Register sub beans
+		final ClassPathScanningCandidateComponentProvider scanner = new ClassPathScanningCandidateComponentProvider(
+				false);
+		final AssignableTypeFilter filter4configBenas = new AssignableTypeFilter(ConfiguredBean.class);
+		scanner.addIncludeFilter(filter4configBenas);
+
+		for (final BeanDefinition bd : scanner.findCandidateComponents("com.logsniffer")) {
+			try {
+				final Class<? extends ConfiguredBean> clazz = (Class<? extends ConfiguredBean>) Class
+						.forName(bd.getBeanClassName());
+				final JsonTypeName jsonNameAnnotation = clazz.getAnnotation(JsonTypeName.class);
+				final List<String> names = new ArrayList<String>();
+				configBeanNames.put(clazz, names);
+				if (jsonNameAnnotation != null) {
+					names.add(jsonNameAnnotation.value());
+					if (jsonNameAnnotation.deprecated() != null) {
+						for (final String dep : jsonNameAnnotation.deprecated()) {
+							names.add(dep);
+						}
+					}
+				}
+				names.add(clazz.getSimpleName());
+				logger.debug("Registered JSON type {} for following names: {}", clazz, names);
+			} catch (final ClassNotFoundException e) {
+				logger.warn("Failed to register JSON type name for " + bd.getBeanClassName(), e);
+			}
+		}
+	}
+
+	/**
+	 * Serializes the bean to JSON.
+	 * 
+	 * @param config
+	 *            the config to serialize
+	 * @param json
+	 *            the JSON object to serialize config data to
+	 * @throws ConfigException
+	 *             in case of serialize errors
+	 */
+	public <BeanType extends ConfiguredBean> String saveBeanToJSON(final BeanType bean) throws ConfigException {
+		try {
+			final String str = jsonMapper.writeValueAsString(bean);
+			return str;
+		} catch (final Exception e) {
+			throw new ConfigException("Failed to serialize bean: " + bean, e);
+		}
+	}
+
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	protected <BeanType> void postConstruct(final ConfiguredBean bean) {
+		if (bean == null) {
+			return;
+		}
+		final PostConstructed pc = AnnotationUtils.findAnnotation(bean.getClass(), PostConstructed.class);
+		if (bean instanceof BeanPostConstructor<?>
+				&& (pc == null || !mappedPostConstrucors.containsKey(bean.getClass()))) {
+			((BeanPostConstructor) bean).postConstruct(bean, this);
+		}
+		if (pc != null) {
+			final BeanPostConstructor bpc = mappedPostConstrucors.get(pc.constructor());
+			if (bpc != null) {
+				bpc.postConstruct(bean, this);
+			} else {
+				logger.error("Unsatisfied bean construction of '{}' due to missing post constructor of type: {}", bean,
+						pc.getClass());
+			}
+		}
+		configInjector.postProcessBeforeInitialization(bean, bean.getClass().getName());
+	}
+
+	/**
+	 * Creates a bean related to the given config. The creation is performed by
+	 * the corresponding bean factory.
+	 * 
+	 * @param clazz
+	 *            the bean class
+	 * @param config
+	 *            the config to use
+	 * @return desired configured bean
+	 * @throws ConfigException
+	 *             in case of errors
+	 */
+	public <BeanType extends ConfiguredBean> BeanType createBeanFromJSON(final Class<BeanType> clazz, final String json)
+			throws ConfigException {
+		try {
+			final BeanType bean = jsonMapper.readValue(json, clazz);
+			return bean;
+		} catch (final Exception e) {
+			throw new ConfigException("Failed to deserialize bean: " + clazz, e);
+		}
+	}
+
+	@Override
+	public String resolveTypeName(final Class<? extends ConfiguredBean> clazz) throws ConfigException {
+		if (configBeanNames.containsKey(clazz) && !configBeanNames.get(clazz).isEmpty()) {
+			return configBeanNames.get(clazz).get(0);
+		}
+		throw new ConfigException("No name defined for type: " + clazz);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T extends ConfiguredBean> Class<? extends T> resolveTypeClass(final String searchNname,
+			final Class<T> wantedSuperType) throws ConfigException {
+		for (final Class<? extends ConfiguredBean> clazz : configBeanNames.keySet()) {
+			if (wantedSuperType == null || wantedSuperType.isAssignableFrom(clazz)) {
+				for (final String name : configBeanNames.get(clazz)) {
+					if (name.equalsIgnoreCase(searchNname)) {
+						return (Class<? extends T>) clazz;
+					}
+				}
+			}
+		}
+		throw new ConfigException(
+				"Couldn't resolve type for name '" + searchNname + "' of type base: " + wantedSuperType);
+	}
+}
